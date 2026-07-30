@@ -1,0 +1,22 @@
+name: BSE 500 Daily 10 PM IST Email
+on:
+  schedule:
+    - cron: '30 16 * * *'
+  workflow_dispatch:
+jobs:
+  update-and-email:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - name: Install dependencies
+        run: pip install pandas openpyxl
+      - name: Run daily update and email
+        env:
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
+        run: python daily_email_update.py
