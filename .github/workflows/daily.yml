@@ -13,7 +13,7 @@ jobs:
         with:
           python-version: '3.10'
       - name: Install dependencies
-        run: pip install pandas openpyxl
+        run: pip install pandas openpyxl requests
       - name: Run daily update and email
         env:
           EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
