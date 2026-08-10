@@ -163,6 +163,26 @@ else:
                 pass
             time.sleep(0.2)
         print(f"Total updated: {updated_count}")
+
+        if "PE Band DETAIL v8" in wb.sheetnames:
+            pe_ws = wb["PE Band DETAIL v8"]
+            cmp_lookup = {}
+            for r in range(2, ws.max_row + 1):
+                code = str(ws.cell(r, 1).value or "").strip()
+                cmp_val = ws.cell(r, 3).value
+                if code and cmp_val:
+                    cmp_lookup[code] = cmp_val
+
+            pe_updated = 0
+            for r in range(2, pe_ws.max_row + 1):
+                pe_code = str(pe_ws.cell(r, 2).value or "").strip()
+                if pe_code in cmp_lookup:
+                    pe_ws.cell(r, 5).value = cmp_lookup[pe_code]
+                    pe_updated += 1
+            print(f"PE Band DETAIL v8: updated CMP on {pe_updated} rows")
+        else:
+            print("WARNING: 'PE Band DETAIL v8' sheet not found in workbook")
+
         out_name = f"BSE_500_DAILY_{now.strftime('%d-%m-%Y_%H-%M')}.xlsx"
         # Also add info sheet
         if "INFO" not in wb.sheetnames:
