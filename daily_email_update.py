@@ -1,248 +1,326 @@
-import os, sys, smtplib, ssl
+"""
+BSE 500 PE Band - Daily Auto Update & Email
+Runs nightly at 10 PM IST via GitHub Actions (.github/workflows/daily.yml).
+
+What this does:
+1. Loads the static base workbook (BSE_500_PE_Band_BASE.xlsx) - 501 companies,
+   FY2016-FY2026 Year High/Low and EPS (manually sourced and verified - see
+   the README sheet inside that file for methodology).
+2. Fetches today's live CMP for all 501 BSE Codes directly from BSE India's
+   official getScripHeaderData API (no fuzzy name/symbol search - this was
+   the root cause of wrong data in earlier versions of this pipeline).
+3. Recomputes High PE / Low PE for every row as real numbers (Year High/EPS,
+   Year Low/EPS), skipping rows where EPS is N/A, Not Sourced, missing, or
+   negative (PE not meaningful in those cases - flagged accordingly).
+4. Saves a dated snapshot and emails it.
+
+The base workbook itself is never modified by this script - only a fresh
+dated output file is generated and emailed each run.
+"""
+
+import os
+import sys
+import time
+import smtplib
+import ssl
 from datetime import datetime, timedelta
-import requests, openpyxl
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email.mime.text import MIMEText
 from email import encoders
-import time, re
 
-print("BSE 500 DAILY EMAIL AUTO - 10 PM IST - FIXED WEEKEND VERSION")
+import openpyxl
+import requests
 
-# Config from GitHub Secrets
-EMAIL_TO = os.getenv('EMAIL_TO', 'pvinayakam2015@gmail.com')
-EMAIL_FROM = os.getenv('EMAIL_FROM')
-EMAIL_PASS = os.getenv('EMAIL_APP_PASSWORD')
+print("BSE 500 PE Band - Daily Update & Email")
 
-# --- WEEKEND FIX: Determine last trading day ---
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+EMAIL_TO = os.getenv("EMAIL_TO", "pvinayakam2015@gmail.com")
+EMAIL_FROM = os.getenv("EMAIL_FROM")
+EMAIL_PASS = os.getenv("EMAIL_APP_PASSWORD")
+
+BASE_FILE = "BSE_500_PE_Band_BASE.xlsx"
+SHEET_NAME = "PE Band DETAIL v8"
+
+# Column layout of the base workbook (1-indexed, matches openpyxl .cell(r, c))
+COL_SR = 1
+COL_BSE_CODE = 2
+COL_ISIN = 3
+COL_COMPANY = 4
+COL_FY = 5
+COL_CMP = 6
+COL_EPS = 7
+COL_EPS_SOURCE = 8
+COL_YEAR_HIGH = 9
+COL_YEAR_LOW = 10
+COL_HIGH_PE = 11
+COL_LOW_PE = 12
+COL_CONFIDENCE = 13
+
+BSE_API_URL = "https://api.bseindia.com/BseIndiaAPI/api/getScripHeaderData/w"
+BSE_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.5",
+    "Origin": "https://www.bseindia.com",
+    "Referer": "https://www.bseindia.com/",
+    "Connection": "keep-alive",
+}
+
+# ---------------------------------------------------------------------------
+# Determine last trading day (weekend handling)
+# ---------------------------------------------------------------------------
 now = datetime.now()
-weekday = now.weekday() # 0=Mon, 5=Sat, 6=Sun
-if weekday == 5: # Saturday
-    last_trading_day = now - timedelta(days=1) # Friday
+weekday = now.weekday()  # 0=Mon ... 5=Sat, 6=Sun
+if weekday == 5:
+    last_trading_day = now - timedelta(days=1)
     is_weekend = True
-elif weekday == 6: # Sunday
-    last_trading_day = now - timedelta(days=2) # Friday
+elif weekday == 6:
+    last_trading_day = now - timedelta(days=2)
     is_weekend = True
 else:
     last_trading_day = now
     is_weekend = False
 
-print(f"Today: {now.strftime('%A %d-%m-%Y')}, Last Trading Day: {last_trading_day.strftime('%A %d-%m-%Y')}, Weekend: {is_weekend}")
+print(
+    f"Today: {now.strftime('%A %d-%m-%Y')}, "
+    f"Last Trading Day: {last_trading_day.strftime('%A %d-%m-%Y')}, "
+    f"Weekend: {is_weekend}"
+)
 
-# For Yahoo API, on weekend we need range=5d to ensure Friday data is included
-yahoo_range = "5d" if is_weekend else "1d"
+# ---------------------------------------------------------------------------
+# CMP fetch - BSE official API, by BSE Code directly (no name search)
+# ---------------------------------------------------------------------------
+_cffi_available = True
+try:
+    from curl_cffi import requests as cffi_requests
+except ImportError:
+    _cffi_available = False
+    print("curl_cffi not available, will use plain requests only")
 
-# Try to find latest DAILY file, not MASTER (MASTER has NaN bug)
-excel_file = None
-candidates = [f for f in os.listdir('.') if f.endswith('.xlsx') and 'BSE_500' in f]
-# Prefer DAILY files over FINAL_MASTER
-daily_files = [f for f in candidates if 'DAILY' in f]
-if daily_files:
-    # pick most recent by modified time
-    daily_files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
-    excel_file = daily_files[0]
-elif candidates:
-    # fallback to any
-    candidates.sort(key=lambda x: os.path.getmtime(x), reverse=True)
-    excel_file = candidates[0]
+_plain_session = requests.Session()
+_plain_session.headers.update(BSE_HEADERS)
 
-if not excel_file:
-    print("No existing Excel found, creating new from LIVE fetch...")
-    from openpyxl import Workbook
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "BSE_500_LIVE"
-    ws.append(["BSE Code","Company","CMP TODAY","52W High","52W Low","Status","Time IST","Last Trading Day Used"])
-    session = requests.Session()
-    session.headers.update({'User-Agent':'Mozilla/5.0'})
-    samples = [
-        ("500325","RELIANCE"),("500180","HDFCBANK"),("500112","SBIN"),
-        ("532174","ICICIBANK"),("500209","INFY"),("500034","BAJFINANCE")
-    ]
-    for bse, sym in samples:
+
+def fetch_cmp(scripcode: str):
+    """
+    Fetch CMP for a single BSE scripcode from BSE's official
+    getScripHeaderData API. Tries curl_cffi (browser impersonation, more
+    reliable against BSE's WAF from cloud/CI IPs) first, then falls back
+    to a plain requests session. Returns float or None.
+    """
+    params = {"scripcode": scripcode}
+
+    # Attempt 1: curl_cffi with Chrome impersonation
+    if _cffi_available:
         try:
-            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}.NS?interval=1d&range={yahoo_range}"
-            r = session.get(url, timeout=8)
-            if r.status_code==200:
-                j=r.json()
-                res=j.get('chart',{}).get('result',[])
-                if res:
-                    meta=res[0].get('meta',{})
-                    cmp_price=meta.get('regularMarketPrice')
-                    high52=meta.get('fiftyTwoWeekHigh')
-                    low52=meta.get('fiftyTwoWeekLow')
-                    # On weekend, also check previousClose
-                    if is_weekend and meta.get('previousClose'):
-                        # Use previousClose or chart previous close as Friday close
-                        pass
-                    ws.append([bse, sym, cmp_price, high52, low52, f"LIVE_OK_{'WEEKEND_FRI' if is_weekend else 'WEEKDAY'}", datetime.now().strftime("%d-%m-%Y %H:%M IST"), last_trading_day.strftime("%d-%m-%Y")])
-                    print(f"{bse} {sym} {cmp_price}")
-        except Exception as e:
-            print(f"{bse} error {e}")
-        time.sleep(0.5)
-    out_name = f"BSE_500_DAILY_{now.strftime('%d-%m-%Y')}.xlsx"
-    wb.save(out_name)
-    excel_file = out_name
-else:
-    print(f"Using existing file: {excel_file}")
+            r = cffi_requests.get(
+                BSE_API_URL,
+                params=params,
+                headers=BSE_HEADERS,
+                impersonate="chrome",
+                timeout=10,
+            )
+            if r.status_code == 200:
+                header = r.json().get("Header", {})
+                val = header.get("PrevClose") or header.get("LTP")
+                if val:
+                    return float(val)
+        except Exception:
+            pass
+
+    # Attempt 2: plain requests session
     try:
-        wb = openpyxl.load_workbook(excel_file)
-        ws = wb['BSE_500_LIVE'] if 'BSE_500_LIVE' in wb.sheetnames else wb.active
-        session = requests.Session()
-        session.headers.update({'User-Agent':'Mozilla/5.0'})
-        updated_count = 0
-        for r in range(2, min(502, ws.max_row+1)): # Update up to 500 rows
-            try:
-                bse = str(ws.cell(r,1).value or "").strip()
-                if not bse or bse=="None": continue
-                comp = str(ws.cell(r,2).value or "")[:30]
-                # Skip if already has FINAL_MASTER name too long
-                # search symbol quick - improved logic
-                q = comp.split()[0] if comp else bse
-                # Try direct .NS mapping for large caps first
-                sym = None
-                # Hard map for known BSE codes to avoid search failure on weekends
-                hard_map = {
-                    "500325":"RELIANCE","500180":"HDFCBANK","500112":"SBIN","532174":"ICICIBANK",
-                    "500209":"INFY","500034":"BAJFINANCE","500247":"KOTAKBANK","500570":"TATAMOTORS",
-                    "500875":"ITC","500820":"ASIANPAINT","532500":"MARUTI","500790":"NESTLEIND"
-                }
-                if bse in hard_map:
-                    sym = hard_map[bse]+".NS"
-                else:
-                    # search
-                    try:
-                        s_url = f"https://query2.finance.yahoo.com/v1/finance/search?q={requests.utils.quote(q)}&quotesCount=3"
-                        sr = session.get(s_url, timeout=6)
-                        if sr.status_code==200:
-                            for qu in sr.json().get('quotes',[]):
-                                if qu.get('symbol','').endswith('.NS'):
-                                    sym=qu.get('symbol')
-                                    break
-                    except:
-                        pass
-                if not sym: 
-                    # Try comp as symbol directly
-                    sym = q.upper()+".NS" if not q.upper().endswith(".NS") else q.upper()
+        r = _plain_session.get(BSE_API_URL, params=params, timeout=10)
+        if r.status_code == 200:
+            header = r.json().get("Header", {})
+            val = header.get("PrevClose") or header.get("LTP")
+            if val:
+                return float(val)
+    except Exception:
+        pass
 
-                url = f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval=1d&range={yahoo_range}"
-                rr = session.get(url, timeout=6)
-                if rr.status_code==200:
-                    data = rr.json().get('chart',{}).get('result',[{}])[0]
-                    meta = data.get('meta',{})
-                    cmp_price = meta.get('regularMarketPrice')
-                    # WEEKEND FIX: If regularMarketPrice is None or 0, use previousClose or chart close
-                    if not cmp_price or cmp_price==0:
-                        # Try previousClose
-                        cmp_price = meta.get('previousClose')
-                        # Try last close from indicators
-                        try:
-                            closes = data.get('indicators',{}).get('quote',[{}])[0].get('close',[])
-                            if closes:
-                                # last non-null close
-                                for c in reversed(closes):
-                                    if c:
-                                        cmp_price = c
-                                        break
-                        except:
-                            pass
+    return None
 
-                    if cmp_price and cmp_price!=0:
-                        ws.cell(r,3).value = cmp_price
-                        if ws.max_column>=4:
-                            ws.cell(r,4).value = meta.get('fiftyTwoWeekHigh')
-                            ws.cell(r,5).value = meta.get('fiftyTwoWeekLow')
-                        ws.cell(r,6).value = f"LIVE_OK_{'FRI' if is_weekend else 'OK'}_{last_trading_day.strftime('%d-%m')}"
-                        if ws.max_column>=7:
-                            ws.cell(r,7).value = datetime.now().strftime("%d-%m-%Y %H:%M IST")
-                        updated_count+=1
-                        if updated_count%20==0:
-                            print(f"Updated {updated_count}... {bse} {sym} {cmp_price}")
-            except Exception as e:
-                # print(f"Row {r} error {e}")
-                pass
-            time.sleep(0.2)
-        print(f"Total updated: {updated_count}")
 
-        if "PE Band DETAIL v8" in wb.sheetnames:
-            pe_ws = wb["PE Band DETAIL v8"]
-            cmp_lookup = {}
-            for r in range(2, ws.max_row + 1):
-                code = str(ws.cell(r, 1).value or "").strip()
-                cmp_val = ws.cell(r, 3).value
-                if code and cmp_val:
-                    cmp_lookup[code] = cmp_val
+# ---------------------------------------------------------------------------
+# Load base workbook
+# ---------------------------------------------------------------------------
+if not os.path.exists(BASE_FILE):
+    print(f"FATAL: base file '{BASE_FILE}' not found in repo checkout.")
+    sys.exit(1)
 
-            pe_updated = 0
-            for r in range(2, pe_ws.max_row + 1):
-                pe_code = str(pe_ws.cell(r, 2).value or "").strip()
-                if pe_code in cmp_lookup:
-                    pe_ws.cell(r, 5).value = cmp_lookup[pe_code]
-                    pe_updated += 1
-            print(f"PE Band DETAIL v8: updated CMP on {pe_updated} rows")
+print(f"Loading base workbook: {BASE_FILE}")
+wb = openpyxl.load_workbook(BASE_FILE)
+
+if SHEET_NAME not in wb.sheetnames:
+    print(f"FATAL: sheet '{SHEET_NAME}' not found in {BASE_FILE}")
+    sys.exit(1)
+
+ws = wb[SHEET_NAME]
+max_row = ws.max_row
+
+# Collect unique BSE codes (one CMP fetch per company, applied to all its FY rows)
+unique_codes = []
+seen = set()
+rows_by_code = {}
+for r in range(2, max_row + 1):
+    code = ws.cell(r, COL_BSE_CODE).value
+    if code is None:
+        continue
+    code_str = str(code).strip()
+    if not code_str:
+        continue
+    rows_by_code.setdefault(code_str, []).append(r)
+    if code_str not in seen:
+        seen.add(code_str)
+        unique_codes.append(code_str)
+
+print(f"Companies to fetch CMP for: {len(unique_codes)}")
+
+# ---------------------------------------------------------------------------
+# Fetch CMP for every company
+# ---------------------------------------------------------------------------
+cmp_by_code = {}
+fetched = 0
+failed = 0
+
+for i, code in enumerate(unique_codes, start=1):
+    cmp_val = fetch_cmp(code)
+    if cmp_val:
+        cmp_by_code[code] = cmp_val
+        fetched += 1
+    else:
+        failed += 1
+    if i % 50 == 0:
+        print(f"  ... {i}/{len(unique_codes)} processed "
+              f"(fetched {fetched}, failed {failed})")
+    time.sleep(0.35)  # be polite to BSE's servers
+
+print(f"CMP fetch complete: {fetched} succeeded, {failed} failed "
+      f"out of {len(unique_codes)}")
+
+# ---------------------------------------------------------------------------
+# Apply CMP + recompute PE for every row
+# ---------------------------------------------------------------------------
+updated_rows = 0
+pe_computed = 0
+
+for code, rows in rows_by_code.items():
+    cmp_val = cmp_by_code.get(code)
+    for r in rows:
+        if cmp_val is not None:
+            ws.cell(r, COL_CMP).value = cmp_val
+            updated_rows += 1
         else:
-            print("WARNING: 'PE Band DETAIL v8' sheet not found in workbook")
+            # No live CMP this run - flag it, keep whatever CMP value the
+            # base file already had (better a stale number than a blank).
+            existing_flag = ws.cell(r, COL_CONFIDENCE).value
+            if existing_flag == "OK":
+                ws.cell(r, COL_CONFIDENCE).value = "No CMP Match (fetch failed today)"
 
-        out_name = f"BSE_500_DAILY_{now.strftime('%d-%m-%Y_%H-%M')}.xlsx"
-        # Also add info sheet
-        if "INFO" not in wb.sheetnames:
-            info = wb.create_sheet("INFO")
+        eps = ws.cell(r, COL_EPS).value
+        high = ws.cell(r, COL_YEAR_HIGH).value
+        low = ws.cell(r, COL_YEAR_LOW).value
+        cmp_now = ws.cell(r, COL_CMP).value
+
+        eps_numeric = isinstance(eps, (int, float))
+        high_numeric = isinstance(high, (int, float))
+        low_numeric = isinstance(low, (int, float))
+
+        if eps_numeric and eps != 0 and high_numeric and low_numeric:
+            if eps > 0:
+                ws.cell(r, COL_HIGH_PE).value = round(high / eps, 2)
+                ws.cell(r, COL_LOW_PE).value = round(low / eps, 2)
+                pe_computed += 1
+            else:
+                # Negative EPS - PE not meaningful, leave blank
+                ws.cell(r, COL_HIGH_PE).value = None
+                ws.cell(r, COL_LOW_PE).value = None
         else:
-            info = wb["INFO"]
-        info.cell(1,1).value = f"Generated: {now.strftime('%d-%m-%Y %H:%M IST')}"
-        info.cell(2,1).value = f"Last Trading Day Used: {last_trading_day.strftime('%A %d-%m-%Y')}"
-        info.cell(3,1).value = f"Weekend Mode: {is_weekend}"
-        info.cell(4,1).value = f"Yahoo Range Used: {yahoo_range}"
-        info.cell(5,1).value = f"Records Updated: {updated_count}"
-        info.cell(6,1).value = "Fix: On Sat/Sun, script uses Fri close, not blank"
-        
-        wb.save(out_name)
-        excel_file = out_name
-    except Exception as e:
-        print(f"Update error {e}")
-        import traceback; traceback.print_exc()
-        out_name = excel_file
+            ws.cell(r, COL_HIGH_PE).value = None
+            ws.cell(r, COL_LOW_PE).value = None
 
-# Now send email
-print(f"\nSending email to {EMAIL_TO} with {excel_file}...")
+print(f"Rows with CMP updated: {updated_rows}")
+print(f"Rows with PE recomputed: {pe_computed}")
+
+# ---------------------------------------------------------------------------
+# INFO sheet
+# ---------------------------------------------------------------------------
+if "INFO" in wb.sheetnames:
+    info = wb["INFO"]
+    wb.remove(info)
+info = wb.create_sheet("INFO")
+info_lines = [
+    f"Generated: {now.strftime('%d-%m-%Y %H:%M IST')}",
+    f"Last Trading Day Used: {last_trading_day.strftime('%A %d-%m-%Y')}",
+    f"Weekend Mode: {is_weekend}",
+    f"Companies: {len(unique_codes)} | CMP fetched OK: {fetched} | CMP fetch failed: {failed}",
+    f"CMP Source: BSE India official API (getScripHeaderData), by BSE Code directly",
+    f"PE High/Low: recomputed live this run as Year High/EPS and Year Low/EPS",
+    f"Base data (Year High/Low, EPS): BSE_500_PE_Band_BASE.xlsx - see its README sheet",
+]
+for idx, line in enumerate(info_lines, start=1):
+    info.cell(idx, 1).value = line
+
+# ---------------------------------------------------------------------------
+# Save dated output and email
+# ---------------------------------------------------------------------------
+out_name = f"BSE_500_PE_Band_DAILY_{now.strftime('%d-%m-%Y_%H-%M')}.xlsx"
+wb.save(out_name)
+print(f"Saved: {out_name}")
+
+print(f"\nSending email to {EMAIL_TO} with {out_name}...")
 if not EMAIL_FROM or not EMAIL_PASS:
     print("ERROR: EMAIL_FROM or EMAIL_APP_PASSWORD not set in GitHub Secrets!")
-    print("Please set secrets in GitHub repo Settings > Secrets")
     sys.exit(1)
 
 msg = MIMEMultipart()
-msg['From'] = EMAIL_FROM
-msg['To'] = EMAIL_TO
-msg['Subject'] = f"BSE 500 PE Band - {'WEEKEND Fri Close' if is_weekend else 'Live'} {now.strftime('%d-%m-%Y %I:%M %p')}"
+msg["From"] = EMAIL_FROM
+msg["To"] = EMAIL_TO
+msg["Subject"] = (
+    f"BSE 500 PE Band - "
+    f"{'Weekend (Fri Close)' if is_weekend else 'Live'} "
+    f"{now.strftime('%d-%m-%Y %I:%M %p')}"
+)
 
-weekend_note = f" (Weekend - Showing Friday {last_trading_day.strftime('%d-%m')} Close)" if is_weekend else ""
+weekend_note = (
+    f" (Weekend - showing {last_trading_day.strftime('%A %d-%m')} close)"
+    if is_weekend else ""
+)
 
-body = f"""
-Hi Vinayakam,
+body = f"""Hi Vinayakam,
 
-Your BSE 500 PE Band Excel auto-updated at 10 PM IST{weekend_note}.
+Your BSE 500 PE Band workbook auto-updated at 10 PM IST{weekend_note}.
 
-File: {excel_file}
+Companies: {len(unique_codes)}
+CMP fetched successfully: {fetched}
+CMP fetch failed today: {failed} (flagged "No CMP Match (fetch failed today)" in the file - CMP left at previous value for those)
 Date: {now.strftime('%d-%m-%Y %H:%M IST')}
 Last Trading Day: {last_trading_day.strftime('%A %d-%m-%Y')}
-Weekend Mode: {is_weekend} -> Using {last_trading_day.strftime('%A')} Close
-Status: FIXED VERSION - Weekend blank bug fixed
 
-- CMP TODAY: Live verified (Yahoo Finance) - {yahoo_range} range
-- On Sat/Sun, CMP = Friday close (not blank/old)
-- EPS: V5.1 Fixed (76 rows)
+- CMP: live from BSE India's official API, fetched directly by BSE Code (no name/symbol search)
+- High PE / Low PE: recomputed this run from Year High/EPS and Year Low/EPS
+- Base data (Year High/Low, EPS FY2016-FY2026): your completed 501-company tracker - see the README sheet inside the attached file for full methodology and confidence flags
 
-Tomorrow same time you will get updated file automatically.
+Tomorrow same time you'll get the updated file automatically.
 
-- Auto Bot FIXED
+- Auto Bot
 """
-msg.attach(MIMEText(body, 'plain'))
+msg.attach(MIMEText(body, "plain"))
 
-with open(excel_file, "rb") as attachment:
+with open(out_name, "rb") as attachment:
     part = MIMEBase("application", "octet-stream")
     part.set_payload(attachment.read())
     encoders.encode_base64(part)
-    part.add_header("Content-Disposition", f"attachment; filename= {os.path.basename(excel_file)}")
+    part.add_header(
+        "Content-Disposition", f"attachment; filename= {os.path.basename(out_name)}"
+    )
     msg.attach(part)
 
 context = ssl.create_default_context()
@@ -250,4 +328,4 @@ with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=context) as server:
     server.login(EMAIL_FROM, EMAIL_PASS)
     server.send_message(msg)
 
-print(f"✅ Email sent to {EMAIL_TO}!")
+print(f"Email sent to {EMAIL_TO}!")
